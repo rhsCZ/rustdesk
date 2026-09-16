@@ -909,10 +909,20 @@ impl RendezvousMediator {
             if let Err(err) = result {
                 log::warn!("webrtc wait_connected failed: {}", err);
                 // Release the pc now rather than waiting for the ICE agent to time out into a
-                // terminal state (~30s); this also drops the SESSIONS entry promptly.
-                stream.close().await;
+                // terminal state (~30s); this also drops the SESSIONS entry promptly. The slot
+                // goes with it and comes back when the teardown has finished, not when this task
+                // gives up on the offer: what it stands for is a peer connection built for an
+                // unauthenticated offer, and one that will not die still costs what it costs.
+                // `pc.close()` has no timeout of its own, so were the slot freed here a teardown
+                // that never finished would leave the pcs to pile up unbounded, with the count
+                // reading zero. Detached, the wait is on WEBRTC_RT, which owns the pc, and not on
+                // this task.
+                stream.close_detached_with(slot);
                 return;
             }
+            // The channel is open: from here the session is a connection like any other, and the
+            // connection layer's own limits apply to it.
+            drop(slot);
             // create_tcp_connection takes ownership of the stream; keep a handle to close the pc
             // once the session returns. It runs the whole session and returns Ok on normal end,
             // Err on setup failure — either way the pc must be closed, else it lingers forever in
