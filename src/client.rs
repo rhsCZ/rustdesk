@@ -5277,8 +5277,7 @@ pub mod peer_online {
         config::{Config, CONNECT_TIMEOUT, READ_TIMEOUT},
         log,
         rendezvous_proto::*,
-        sleep,
-        ResultType, Stream,
+        sleep, ResultType, Stream,
     };
 
     pub async fn query_online_states<F: FnOnce(Vec<String>, Vec<String>)>(ids: Vec<String>, f: F) {
