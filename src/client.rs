@@ -33,6 +33,7 @@ use crate::{
     create_symmetric_key_msg, decode_id_pk, decode_id_pk_dtls, dtls_fingerprint_bound, get_rs_pk,
     is_keyboard_mode_supported,
     kcp_stream::KcpStream,
+    rendezvous_mediator::connect_rendezvous,
     secure_tcp, secure_tcp_required,
     ui_interface::{get_builtin_option, resolve_avatar_url, use_texture_render},
     ui_session_interface::{InvokeUiSession, Session},
@@ -813,7 +814,7 @@ impl Client {
         // into_inner() once the stream is adopted into a connection attempt.
         let mut webrtc_offerer = webrtc_offerer.map(OffererGuard::new);
         let mut start = Instant::now();
-        let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
+        let mut socket = connect_rendezvous(&*rendezvous_server, CONNECT_TIMEOUT).await;
         debug_assert!(!servers.contains(&rendezvous_server));
         let rtt = start.elapsed();
         log::debug!("TCP connection establishment time used: {:?}", rtt);
@@ -821,7 +822,7 @@ impl Client {
             log::info!("try the other servers: {:?}", servers);
             for server in servers {
                 let server = check_port(server, RENDEZVOUS_PORT);
-                socket = connect_tcp(&*server, CONNECT_TIMEOUT).await;
+                socket = connect_rendezvous(&*server, CONNECT_TIMEOUT).await;
                 if socket.is_ok() {
                     rendezvous_server = server;
                     break;
@@ -871,7 +872,7 @@ impl Client {
                         err
                     );
                     webrtc_offerer = None;
-                    socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await?;
+                    socket = connect_rendezvous(&*rendezvous_server, CONNECT_TIMEOUT).await?;
                     my_addr = socket.local_addr();
                 }
             }
@@ -1774,7 +1775,7 @@ impl Client {
 
         for i in 1..=3 {
             // use different socket due to current hbbs implementation requiring different nat address for each attempt
-            let mut socket = connect_tcp(rendezvous_server, CONNECT_TIMEOUT)
+            let mut socket = connect_rendezvous(rendezvous_server, CONNECT_TIMEOUT)
                 .await
                 .with_context(|| "Failed to connect to rendezvous server")?;
 
@@ -5223,7 +5224,7 @@ async fn hc_connection_(
     let mut keep_alive = crate::DEFAULT_KEEP_ALIVE;
 
     let host = check_port(&rendezvous_server, RENDEZVOUS_PORT);
-    let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
+    let mut conn = connect_rendezvous(host.clone(), CONNECT_TIMEOUT).await?;
     let key = crate::get_key(true).await;
     crate::secure_tcp(&mut conn, &key).await?;
     let mut msg_out = RendezvousMessage::new();
@@ -5270,13 +5271,13 @@ async fn hc_connection_(
 }
 
 pub mod peer_online {
+    use crate::rendezvous_mediator::connect_rendezvous;
     use hbb_common::{
         anyhow::bail,
         config::{Config, CONNECT_TIMEOUT, READ_TIMEOUT},
         log,
         rendezvous_proto::*,
         sleep,
-        socket_client::connect_tcp,
         ResultType, Stream,
     };
 
@@ -5312,7 +5313,7 @@ pub mod peer_online {
             bail!("Invalid server address: {}", rendezvous_server);
         }
         let online_server = format!("{}:{}", tmp[0], port - 1);
-        connect_tcp(online_server, CONNECT_TIMEOUT).await
+        connect_rendezvous(online_server, CONNECT_TIMEOUT).await
     }
 
     async fn query_online_states_(

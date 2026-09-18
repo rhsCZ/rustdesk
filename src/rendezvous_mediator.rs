@@ -73,6 +73,31 @@ const ICE_DEDUP_WINDOW: usize = 256;
 /// connections in number and in time for every transport alike.
 const MAX_WEBRTC_ANSWERERS: usize = 16;
 static WEBRTC_ANSWERERS: AtomicUsize = AtomicUsize::new(0);
+/// The largest message the rendezvous server may send. Nothing it sends is large - a punch, a
+/// relay request, a candidate, a config update - and there is no authorization to lift this at,
+/// so it stays for the life of the connection. It goes on before the key exchange, which is the
+/// first read.
+pub const MAX_RENDEZVOUS_MESSAGE: usize = 128 * 1024;
+/// A candidate is a few hundred bytes, and the queue holds `MAX_PENDING_REMOTE_ICE` of them per
+/// session unparsed until the answerer applies them; the message cap alone would let a session's
+/// queue hold 64 messages' worth.
+const MAX_ICE_CANDIDATE_LEN: usize = 4 * 1024;
+
+/// `connect_tcp` to the rendezvous server, bounded before anything is read from it.
+pub async fn connect_rendezvous<
+    't,
+    T: IntoTargetAddr<'t>
+        + tokio::net::ToSocketAddrs
+        + socket_client::IsResolvedSocketAddr
+        + std::fmt::Display,
+>(
+    target: T,
+    ms_timeout: u64,
+) -> ResultType<Stream> {
+    let mut stream = connect_tcp(target, ms_timeout).await?;
+    stream.set_max_packet_length(MAX_RENDEZVOUS_MESSAGE);
+    Ok(stream)
+}
 
 /// One of the `MAX_WEBRTC_ANSWERERS` slots, given back on drop.
 struct AnswererSlot;
@@ -165,6 +190,8 @@ static UNKNOWN_ICE_SESSION_LOG: hbb_common::log_throttle::LogThrottle =
 static REJECTED_REMOTE_ICE_LOG: hbb_common::log_throttle::LogThrottle =
     hbb_common::log_throttle::LogThrottle::new(ICE_LOG_INTERVAL);
 static FULL_ICE_QUEUE_LOG: hbb_common::log_throttle::LogThrottle =
+    hbb_common::log_throttle::LogThrottle::new(ICE_LOG_INTERVAL);
+static OVERSIZE_ICE_LOG: hbb_common::log_throttle::LogThrottle =
     hbb_common::log_throttle::LogThrottle::new(ICE_LOG_INTERVAL);
 
 struct IceRoute {
@@ -558,6 +585,12 @@ impl RendezvousMediator {
                 });
             }
             Some(rendezvous_message::Union::IceCandidate(ice)) => {
+                if ice.candidate.len() > MAX_ICE_CANDIDATE_LEN {
+                    if let Some(n) = OVERSIZE_ICE_LOG.due() {
+                        log::debug!("dropped {} oversize ICE candidate(s)", n);
+                    }
+                    return Ok(());
+                }
                 let queued = {
                     let mut txs = WEBRTC_ICE_TXS.lock().await;
                     txs.get_mut(&ice.session_key)
@@ -600,7 +633,7 @@ impl RendezvousMediator {
     pub async fn start_tcp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
         log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
-        let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
+        let mut conn = connect_rendezvous(host.clone(), CONNECT_TIMEOUT).await?;
         let key = crate::get_key(true).await;
         crate::secure_tcp(&mut conn, &key).await?;
         let mut rz = Self {
@@ -717,7 +750,7 @@ impl RendezvousMediator {
             secure,
         );
 
-        let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+        let mut socket = connect_rendezvous(&*self.host, CONNECT_TIMEOUT).await?;
         // A relay response carrying an answer carries this machine's ICE candidates with it, so
         // that half goes out only on an encrypted channel. A server that does not complete the
         // exchange loses the answer, not the relay: the response goes without it, on a fresh
@@ -729,7 +762,7 @@ impl RendezvousMediator {
             if let Err(err) = crate::secure_tcp_required(&mut socket, &key).await {
                 log::warn!("relaying without the WebRTC answer, it cannot be encrypted: {err}");
                 webrtc_sdp_answer = String::new();
-                socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+                socket = connect_rendezvous(&*self.host, CONNECT_TIMEOUT).await?;
             }
         }
 
@@ -839,7 +872,7 @@ impl RendezvousMediator {
             );
             bail!("no place among the punches in flight");
         };
-        let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+        let mut socket = connect_rendezvous(&*self.host, CONNECT_TIMEOUT).await?;
         let local_addr = socket.local_addr();
         // we saw invalid local_addr while using proxy, local_addr.ip() == "::1"
         let local_addr: SocketAddr =
@@ -953,7 +986,7 @@ impl RendezvousMediator {
                     // restart or an idle-killed connection fails on the stale stream.
                     for _ in 0..2 {
                         if conn.is_none() {
-                            match connect_tcp(&*host, CONNECT_TIMEOUT).await {
+                            match connect_rendezvous(&*host, CONNECT_TIMEOUT).await {
                                 Ok(mut s) => {
                                     // Candidates are every interface address of this machine:
                                     // sent only on a channel that is actually encrypted, else
@@ -1166,7 +1199,7 @@ impl RendezvousMediator {
             // is made — the controller keeps its request socket for trickled ICE.
             let mut msg_out = Message::new();
             msg_out.set_punch_hole_sent(msg_punch);
-            let mut socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+            let mut socket = connect_rendezvous(&*self.host, CONNECT_TIMEOUT).await?;
             // The answer goes out only on a channel that is actually encrypted; otherwise this
             // WebRTC attempt is abandoned and the controller falls back to its other transports.
             crate::secure_tcp_required(&mut socket, &crate::get_key(true).await).await?;
@@ -1175,7 +1208,7 @@ impl RendezvousMediator {
         }
         log::debug!("Punch tcp hole to {:?}", peer_addr);
         let mut socket = {
-            let socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
+            let socket = connect_rendezvous(&*self.host, CONNECT_TIMEOUT).await?;
             let local_addr = socket.local_addr();
             // key important here for punch hole to tell my gateway incoming peer is safe.
             // Awaited rather than spawned so the mapping exists before `PunchHoleSent` goes out;
@@ -1730,9 +1763,11 @@ impl Drop for CheckIfResendPk {
 #[cfg(test)]
 mod tests {
     use super::{
-        connection_meta, mpsc, socket_client, tokio, udp_nat_listen, AnswererSlot, Arc, IceRoute,
-        IntoTargetAddr, Ordering, PunchHoleSent, RendezvousMediator, RendezvousMessage,
-        ICE_DEDUP_WINDOW, MAX_PENDING_REMOTE_ICE, MAX_WEBRTC_ANSWERERS, TCP_PUNCHES, UDP_PUNCHES,
+        connect_rendezvous, connection_meta, mpsc, rendezvous_message, socket_client, tokio,
+        udp_nat_listen, AnswererSlot, Arc, Duration, IceCandidate, IceRoute, IntoTargetAddr,
+        Ordering, PunchHoleSent, RendezvousMediator, RendezvousMessage, Sink, ICE_DEDUP_WINDOW,
+        MAX_ICE_CANDIDATE_LEN, MAX_PENDING_REMOTE_ICE, MAX_RENDEZVOUS_MESSAGE, MAX_WEBRTC_ANSWERERS,
+        TCP_PUNCHES, UDP_PUNCHES, WEBRTC_ICE_TXS,
     };
     use hbb_common::{protobuf::Message as _, tcp::new_listener};
     use std::net::SocketAddr;
@@ -1859,6 +1894,89 @@ mod tests {
                 "the place must come back with the wait"
             );
         });
+    }
+
+    // The bound is on before the first read, so a header declaring more is refused with nothing
+    // of it buffered - on the very connection the key exchange is about to read.
+    #[tokio::test]
+    async fn connect_rendezvous_refuses_a_large_frame_on_its_header() {
+        use hbb_common::tokio::io::AsyncWriteExt;
+        let listener = new_listener("127.0.0.1:0", false).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (conn, accepted) =
+            tokio::join!(connect_rendezvous(addr.to_string(), 3000), listener.accept());
+        let (mut conn, (mut server, _)) = (conn.unwrap(), accepted.unwrap());
+
+        let n = MAX_RENDEZVOUS_MESSAGE + 1;
+        server
+            .write_all(&(((n << 2) | 0x3) as u32).to_le_bytes())
+            .await
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(5), conn.next()).await {
+            Ok(Some(Err(e))) => assert!(e.to_string().contains("Too big packet"), "{}", e),
+            Ok(other) => panic!(
+                "expected a refusal, got {:?}",
+                other.map(|r| r.map(|b| b.len()))
+            ),
+            Err(_) => panic!("next() waited for a payload the header should have refused"),
+        }
+    }
+
+    // A candidate is held unparsed until the answerer applies it, so its size is bounded before
+    // it is offered a place in the queue, not only by the rendezvous message cap.
+    #[tokio::test]
+    async fn an_oversize_ice_candidate_never_reaches_the_queue() {
+        let (tx, mut rx) = mpsc::channel::<String>(MAX_PENDING_REMOTE_ICE);
+        let key = "oversize-ice-candidate".to_owned();
+        WEBRTC_ICE_TXS
+            .lock()
+            .await
+            .insert(key.clone(), IceRoute::new(tx));
+        let listener = new_listener("127.0.0.1:0", false).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut sink = socket_client::connect_tcp_local(addr, None, 3000)
+            .await
+            .unwrap();
+        let mut mediator = RendezvousMediator {
+            addr: addr.into_target_addr().unwrap(),
+            host: addr.to_string(),
+            host_prefix: String::new(),
+            keep_alive: 0,
+        };
+        let server = crate::server::new_for_test();
+        let ice = |candidate: String| {
+            let mut ic = IceCandidate::new();
+            ic.session_key = key.clone();
+            ic.candidate = candidate;
+            Some(rendezvous_message::Union::IceCandidate(ic))
+        };
+
+        mediator
+            .handle_resp(
+                ice("x".repeat(MAX_ICE_CANDIDATE_LEN + 1)),
+                Sink::Stream(&mut sink),
+                &server,
+                &mut || {},
+            )
+            .await
+            .unwrap();
+        assert!(rx.try_recv().is_err(), "an oversize candidate must not be queued");
+
+        mediator
+            .handle_resp(
+                ice("x".repeat(MAX_ICE_CANDIDATE_LEN)),
+                Sink::Stream(&mut sink),
+                &server,
+                &mut || {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap().len(),
+            MAX_ICE_CANDIDATE_LEN,
+            "at the bound it is queued"
+        );
+        WEBRTC_ICE_TXS.lock().await.remove(&key);
     }
 
     // A SOCKS proxy makes `connect_tcp_local` dial the proxy and ignore the local address, so
