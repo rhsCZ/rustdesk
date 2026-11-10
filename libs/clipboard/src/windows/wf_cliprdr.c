@@ -2447,7 +2447,11 @@ static FILEDESCRIPTORW *wf_cliprdr_get_file_descriptor(WCHAR *file_name, size_t 
 	fd->dwFileAttributes = GetFileAttributesW(file_name);
 	if (fd->dwFileAttributes == INVALID_FILE_ATTRIBUTES)
 	{
-		// TODO: debug handle some errors
+		// INVALID_FILE_ATTRIBUTES has FILE_ATTRIBUTE_DIRECTORY set, so the entry would go out as
+		// an empty directory in place of the file.
+		CloseHandle(hFile);
+		free(fd);
+		return NULL;
 	}
 
 	if (!GetFileTime(hFile, NULL, NULL, &fd->ftLastWriteTime))
@@ -2462,8 +2466,8 @@ static FILEDESCRIPTORW *wf_cliprdr_get_file_descriptor(WCHAR *file_name, size_t 
 	// with the number of files and not with their size.
 	//
 	// GetFileSize() reports failure as INVALID_FILE_SIZE, which cannot be told apart from a
-	// genuine 4GB-1 file without GetLastError(), and it fails outright on the directory
-	// handles FILE_FLAG_BACKUP_SEMANTICS lets us open above. A directory gets no size. A
+	// genuine 4GB-1 file without GetLastError(). A directory gets no size: whatever the
+	// handle FILE_FLAG_BACKUP_SEMANTICS lets us open above reports is not a file size. A
 	// file whose size cannot be read is rejected rather than sent with the flag off: the
 	// Unix receiver reads the size fields whether or not the flag is set, for compatibility
 	// with older Windows senders, and would take the zero for an empty file.
@@ -2560,8 +2564,11 @@ static BOOL wf_cliprdr_add_to_file_arrays(wfClipboard *clipboard, WCHAR *full_fi
 		return FALSE;
 	}
 
+	// Receivers never read an empty file, so the audit waits for the first file with content.
 	if ((clipboard->fileDescriptor[clipboard->nFiles]->dwFileAttributes &
 		 FILE_ATTRIBUTE_DIRECTORY) == 0 &&
+		(clipboard->fileDescriptor[clipboard->nFiles]->nFileSizeLow |
+		 clipboard->fileDescriptor[clipboard->nFiles]->nFileSizeHigh) != 0 &&
 		clipboard->first_file_index == (size_t)-1) {
 		clipboard->first_file_index = clipboard->nFiles;
 	}
@@ -3540,24 +3547,15 @@ wf_cliprdr_server_file_contents_request(CliprdrClientContext *context,
 	{
 		if (fileContentsRequest->dwFlags == FILECONTENTS_SIZE)
 		{
-			FILEDESCRIPTORW *fd;
-
 			if (clipboard->nFiles <= fileContentsRequest->listIndex)
 			{
 				rc = ERROR_INTERNAL_ERROR;
 				goto exit;
 			}
-
-			fd = clipboard->fileDescriptor[fileContentsRequest->listIndex];
-			// The size fields only mean anything when FD_FILESIZE says so. Answering with
-			// them regardless would describe an entry whose size could not be read as empty.
-			if ((fd->dwFlags & FD_FILESIZE) == 0)
-			{
-				rc = ERROR_INTERNAL_ERROR;
-				goto exit;
-			}
-			*((UINT32 *)&pData[0]) = fd->nFileSizeLow;
-			*((UINT32 *)&pData[4]) = fd->nFileSizeHigh;
+			*((UINT32 *)&pData[0]) =
+				clipboard->fileDescriptor[fileContentsRequest->listIndex]->nFileSizeLow;
+			*((UINT32 *)&pData[4]) =
+				clipboard->fileDescriptor[fileContentsRequest->listIndex]->nFileSizeHigh;
 			uSize = cbRequested;
 		}
 		else if (fileContentsRequest->dwFlags == FILECONTENTS_RANGE)
